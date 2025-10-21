@@ -4,12 +4,18 @@ pipeline {
   options {
     timestamps()
     ansiColor('xterm')
-    skipDefaultCheckout(true)   // turn off the implicit "Declarative: Checkout SCM"
+    skipDefaultCheckout(true) // disable implicit "Declarative: Checkout SCM"
   }
 
   environment {
-    // Talking to planner on the host (your Option A)
-    AI_PLANNER_URL = 'http://host.docker.internal:8000'
+    // Pick ONE endpoint style:
+
+    // A) If Jenkins & planner containers are on the same Docker network (Compose):
+    AI_PLANNER_URL = 'http://ai-planner:8000'
+
+    // B) If you want to hit a planner on the host (Docker Desktop):
+    // AI_PLANNER_URL = 'http://host.docker.internal:8000'
+
     NPM_CONFIG_CACHE = "${WORKSPACE}/.npm"
     CI = "true"
   }
@@ -17,9 +23,7 @@ pipeline {
   stages {
     stage('Checkout') {
       steps {
-        script {
-          deleteDir() // clean workspace
-        }
+        script { deleteDir() }
         git url: 'https://github.com/sadiq-git/jenkins', branch: 'master'
       }
     }
@@ -48,75 +52,64 @@ pipeline {
     stage('AI Planning (Gemini)') {
       steps {
         script {
-          // Add host.docker.internal for Linux; harmless on Mac/Win
-          def dockerNetOpts = '--add-host=host.docker.internal:host-gateway -u 0:0'
+          // Network choice:
+          // A) Share Jenkins container’s network namespace (BEST when using service name ai-planner)
+          def dockerNetOpts = "--network container:${env.HOSTNAME} -u 0:0"
 
-          // IMPORTANT: single-quoted triple quotes so $... is NOT interpolated by Groovy
+          // B) Or, if AI_PLANNER_URL is host.docker.internal, use host-gateway instead:
+          // def dockerNetOpts = '--add-host=host.docker.internal:host-gateway -u 0:0'
+
+          // Single-quoted so $VARS expand inside the container, not in Groovy.
           def plannerScript = '''
             set -e
 
-            echo "Requesting plan from $AI_PLANNER_URL"
+            echo "Planner URL: $AI_PLANNER_URL"
 
-            # 1) Quick health check (don’t -f; we want to see non-200 too)
-            if ! curl -sS --connect-timeout 3 --max-time 5 "$AI_PLANNER_URL/healthz" >/dev/null; then
-              echo "Planner health check failed; using fallback plan."
-              cat > ai_plan.lock.json <<'JSON'
-              {
-                "stages":[
-                  { "name":"Checkout Code",        "command":"echo \\"Repo: $${REPO_NAME}, branch: $${BRANCH}, build: $${BUILD_NUMBER}\\"" },
-                  { "name":"Install Dependencies", "command":"npm ci --prefer-offline || npm install --prefer-offline || true" },
-                  { "name":"Build Project",        "command":"npm run build || echo \\"No build script, skipping.\\"" },
-                  { "name":"Run Unit Tests",       "command":"npm test || echo \\"No tests, skipping.\\"" }
-                ]
-              }
-              JSON
-              jq . ai_plan.lock.json > ai_plan.json
-              echo "health-check-failed" > .http_status
-              exit 0
+            # Health check; require 200
+            hc="$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 5 "$AI_PLANNER_URL/healthz" || true)"
+            echo "Planner /healthz HTTP: ${hc:-<none>}"
+            if [ "$hc" != "200" ]; then
+              echo "ERROR: Planner health check failed (got '$hc')."
+              exit 2
             fi
 
-            # 2) Ask /plan with generous timeout + retries
+            # Request plan (retry a few times to absorb transient latency)
             status=""
             for delay in 0 2 4; do
               [ "$delay" -gt 0 ] && sleep "$delay"
-              status="$(curl -sS -o ai_plan.raw -w "%{http_code}" \
-                         --connect-timeout 5 --max-time 60 \
-                         -X POST "$AI_PLANNER_URL/plan" \
-                         -H "Content-Type: application/json" \
-                         --data-binary @context.json || true)"
+              status="$(curl -sS -o ai_plan.raw -w '%{http_code}' \
+                        --connect-timeout 10 --max-time 120 \
+                        -X POST "$AI_PLANNER_URL/plan" \
+                        -H 'Content-Type: application/json' \
+                        --data-binary @context.json || true)"
               if [ "$status" = "200" ] && jq -e . ai_plan.raw >/dev/null 2>&1; then
                 break
               fi
             done
             echo "$status" > .http_status
 
-            echo "Planner HTTP status: $status"
+            echo "Planner /plan HTTP: $status"
             echo "---- planner raw (first 400 bytes) ----"
-            [ -f ai_plan.raw ] && head -c 400 ai_plan.raw || echo "(no body)"
+            if [ -f ai_plan.raw ]; then head -c 400 ai_plan.raw; else echo "(no body)"; fi
             echo
             echo "---------------------------------------"
 
-            if [ "$status" = "200" ] && jq -e . ai_plan.raw >/dev/null 2>&1; then
-              mv ai_plan.raw ai_plan.lock.json
-              jq . ai_plan.lock.json > ai_plan.json
-            else
-              echo "Planner failed or returned non-JSON. Using fallback plan."
-              cat > ai_plan.lock.json <<'JSON'
-{
-  "stages":[
-    { "name":"Checkout Code",        "command":"echo \\"Repo: $${REPO_NAME}, branch: $${BRANCH}, build: $${BUILD_NUMBER}\\"" },
-    { "name":"Install Dependencies", "command":"npm ci --prefer-offline || npm install --prefer-offline || true" },
-    { "name":"Build Project",        "command":"npm run build || echo \\"No build script, skipping.\\"" },
-    { "name":"Run Unit Tests",       "command":"npm test || echo \\"No tests, skipping.\\"" }
-  ]
-}
-JSON
-              jq . ai_plan.lock.json > ai_plan.json
+            if [ "$status" != "200" ]; then
+              echo "ERROR: Planner returned non-200 ($status)."
+              exit 3
             fi
+
+            if ! jq -e . ai_plan.raw >/dev/null 2>&1; then
+              echo "ERROR: Planner did not return valid JSON."
+              exit 4
+            fi
+
+            mv ai_plan.raw ai_plan.lock.json
+            jq . ai_plan.lock.json > ai_plan.json
           '''.stripIndent()
 
           docker.image('node-ci:20-bookworm-slim').inside(dockerNetOpts) {
-            sh label: 'Request plan from AI', script: plannerScript
+            sh label: 'Request plan from AI (no fallback)', script: plannerScript
           }
         }
       }
@@ -125,6 +118,10 @@ JSON
     stage('Execute Plan (Node)') {
       steps {
         script {
+          if (!fileExists('ai_plan.lock.json')) {
+            error "Planner did not produce ai_plan.lock.json; aborting (no fallback allowed)."
+          }
+
           def ctx = readJSON file: 'context.json'
           withEnv([
             "BRANCH=${ctx.branch}",

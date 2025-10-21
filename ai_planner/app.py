@@ -1,9 +1,9 @@
 from __future__ import annotations
-import os, json, re
+import os, json, re, traceback, logging
 from typing import Any, Dict, List
 
 from flask import Flask, request, jsonify
-from google import genai  # modern client: pip install google-genai
+from google import genai  # requires: google-genai>=0.1.0
 
 from policy import is_allowed
 
@@ -37,10 +37,16 @@ Rules:
 
 def _extract_json(maybe_json: str) -> str:
     """
-    Try to pull a JSON object from a freeform LLM response.
+    Extract the first JSON object from a Gemini response.
+    Strips markdown code fences and any stray text.
     """
-    m = re.search(r"\{.*\}\s*$", maybe_json, flags=re.S)
-    return m.group(0) if m else maybe_json
+    if not isinstance(maybe_json, str):
+        return "{}"
+    cleaned = re.sub(r"```(json)?", "", maybe_json, flags=re.IGNORECASE)
+    cleaned = cleaned.replace("```", "").strip()
+    # Grab the first {...} block
+    m = re.search(r"\{[\s\S]*\}", cleaned)
+    return m.group(0) if m else cleaned
 
 def _sanitize_name(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9 ._-]", "", name)[:40]
@@ -61,21 +67,46 @@ def _postprocess_and_filter(plan: Dict[str, Any]) -> Dict[str, Any]:
 def make_app() -> Flask:
     app = Flask(__name__)
 
+    # --- Logging: integrate with gunicorn if present ---
+    gunicorn_error_logger = logging.getLogger("gunicorn.error")
+    if gunicorn_error_logger.handlers:
+        app.logger.handlers = gunicorn_error_logger.handlers
+        app.logger.setLevel(gunicorn_error_logger.level)
+    else:
+        logging.basicConfig(level=logging.INFO)
+
+    # --- GenAI client ---
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
+        # We still raise here so container fails fast if key is missing.
+        # (healthz doesn't call the API, so missing key would be confusing later)
         raise RuntimeError("GEMINI_API_KEY must be set")
-
     client = genai.Client(api_key=api_key)
+    app.config["GENAI_CLIENT"] = client
+
+    @app.get("/")
+    def root():
+        return jsonify({"ok": True, "endpoints": ["/healthz", "/plan", "/echo"], "model": GEMINI_MODEL})
 
     @app.get("/healthz")
     def healthz():
-        return {"ok": True, "model": GEMINI_MODEL}, 200
+        # Does not call the model; just reports readiness and chosen model
+        return jsonify({"ok": True, "model": GEMINI_MODEL})
+
+    @app.post("/echo")
+    def echo():
+        data = request.get_json(silent=True)
+        return jsonify({"received": data}), 200
 
     @app.post("/plan")
     def plan():
-        ctx = request.get_json(silent=True) or {}
-
-        prompt = f"""
+        """
+        Returns 200 with a valid JSON body ALWAYS.
+        On any error, responds with SAFE_FALLBACK_PLAN + meta explaining the reason.
+        """
+        try:
+            ctx = request.get_json(silent=True) or {}
+            prompt = f"""
 You are a CI/CD planner that outputs STRICT JSON only.
 Given this Jenkins context:
 {json.dumps(ctx, indent=2)}
@@ -90,22 +121,55 @@ Focus:
 - Avoid secrets/inline tokens.
 """
 
-        try:
-            resp = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt
-            )
-            text = (resp.text or "").strip()
-            raw_json = _extract_json(text).strip()
-            plan_dict = json.loads(raw_json)
+            # --- Call Gemini securely ---
+            try:
+                resp = app.config["GENAI_CLIENT"].models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=prompt
+                )
+                # Prefer resp.text if available; otherwise try candidates
+                text = getattr(resp, "text", None)
+                if not text:
+                    try:
+                        cand0 = (resp.candidates or [])[0]
+                        # Depending on SDK shape; try common paths
+                        part0 = getattr(cand0, "content", None)
+                        if part0 and getattr(part0, "parts", None):
+                            text = part0.parts[0].text
+                    except Exception:
+                        text = ""
+            except Exception as e:
+                app.logger.exception("Gemini call failed")
+                return jsonify({
+                    "stages": SAFE_FALLBACK_PLAN["stages"],
+                    "meta": {"fallback": True, "reason": f"gemini_error: {str(e)}"}
+                }), 200
+
+            # --- Parse JSON from model text ---
+            try:
+                raw_json = _extract_json(text).strip()
+                plan_dict = json.loads(raw_json)
+            except Exception as e:
+                app.logger.warning("JSON parse failed; returning fallback: %s", e)
+                return jsonify({
+                    "stages": SAFE_FALLBACK_PLAN["stages"],
+                    "meta": {"fallback": True, "reason": f"json_error: {str(e)}", "raw": (text or "")[:800]}
+                }), 200
+
+            # --- Filter & return ---
+            filtered = _postprocess_and_filter(plan_dict)
+            return jsonify(filtered), 200
+
         except Exception as e:
+            app.logger.exception("Unhandled /plan error")
             return jsonify({
                 "stages": SAFE_FALLBACK_PLAN["stages"],
-                "meta": {"fallback": True, "reason": str(e)}
+                "meta": {
+                    "fallback": True,
+                    "reason": f"unhandled: {str(e)}",
+                    "trace": traceback.format_exc()[:1200]
+                }
             }), 200
-
-        filtered = _postprocess_and_filter(plan_dict)
-        return jsonify(filtered), 200
 
     return app
 

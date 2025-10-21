@@ -3,7 +3,6 @@ pipeline {
   options { timestamps(); ansiColor('xterm') }
   environment {
     AI_PLANNER_URL = 'http://ai-planner:8000'
-    // Put npm cache in workspace to persist across runs
     NPM_CONFIG_CACHE = "${WORKSPACE}/.npm"
     CI = "true"
   }
@@ -30,7 +29,7 @@ pipeline {
       }
     }
 
-    stage('AI Planning (Gemini)') {
+    stage('AI Planning (Gemini)) {
       steps {
         script {
           timeout(time: 90, unit: 'SECONDS') {
@@ -44,14 +43,13 @@ pipeline {
               """
             }
           }
-          def planText = readFile('ai_plan.json')
-          def plan = new groovy.json.JsonSlurperClassic().parseText(planText)
-
+          def plan = readJSON file: 'ai_plan.json'
           echo "AI Suggested Plan:"
           plan.stages.eachWithIndex { stg, i ->
             echo String.format("  %02d) %s  ::  %s", i+1, stg.name, stg.command)
           }
-          env.AI_PLAN_TEXT = planText
+          // Keep the JSON available for the next stage
+          writeFile file: 'ai_plan.lock.json', text: groovy.json.JsonOutput.toJson(plan)
         }
       }
     }
@@ -59,27 +57,20 @@ pipeline {
     stage('Execute Plan (Node)') {
       steps {
         script {
-          // Always run inside a Node image so npm/node exist
           docker.image('node:20-bookworm-slim').inside('-u 0:0') {
-            // Basic tooling for native modules and scripts that need git
             sh '''
               set -e
               apt-get update -y
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                git ca-certificates python3 make g++ curl
+                git ca-certificates python3 make g++ curl jq
               mkdir -p "$NPM_CONFIG_CACHE"
-            '''
-
-            // Optional: install deps up-front to speed up the AI stages
-            sh '''
               if [ -f package-lock.json ]; then
                 npm ci --no-audit --prefer-offline || true
               elif [ -f package.json ]; then
                 npm install --no-audit --prefer-offline || true
               fi
             '''
-
-            def plan = new groovy.json.JsonSlurperClassic().parseText(env.AI_PLAN_TEXT)
+            def plan = readJSON file: 'ai_plan.lock.json'
             plan.stages.each { stg ->
               stage("AI: ${stg.name}") {
                 sh label: stg.name, script: stg.command
@@ -91,6 +82,6 @@ pipeline {
     }
   }
   post {
-    always { archiveArtifacts artifacts: 'context.json, ai_plan.json', onlyIfSuccessful: false }
+    always { archiveArtifacts artifacts: 'context.json, ai_plan.json, ai_plan.lock.json', onlyIfSuccessful: false }
   }
 }

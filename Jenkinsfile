@@ -9,7 +9,6 @@ pipeline {
   }
 
   environment {
-    // Pick ONE endpoint style:
     // A) Same Docker network (Compose): service name works
     AI_PLANNER_URL = 'http://ai-planner:8000'
     // B) Or, if planner is on the host (Docker Desktop):
@@ -59,7 +58,7 @@ pipeline {
 
           // Single-quoted => env vars expand inside the container shell, not by Groovy.
           def plannerScript = '''
-            set -euo pipefail
+            set -eu
 
             echo "Planner URL: $AI_PLANNER_URL"
 

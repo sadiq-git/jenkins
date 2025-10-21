@@ -45,41 +45,36 @@ pipeline {
     stage('AI Planning (Gemini)') {
       steps {
         script {
-          // share Jenkins container network so "ai-planner" DNS works
-          def netOpt = "--network container:${env.HOSTNAME}"
+          def netOpt = "--network container:${env.HOSTNAME}"  // share Jenkins container network
 
           docker.image('node-ci:20-bookworm-slim').inside("${netOpt} -u 0:0") {
             sh label: 'Request plan from AI', script: '''
               set -e
 
               echo "Requesting plan from $AI_PLANNER_URL"
-              http_status=$(curl -sS -o ai_plan.raw -w "%{http_code}" \
-                -X POST "$AI_PLANNER_URL/plan" \
-                -H "Content-Type: application/json" \
-                --data-binary @context.json)
-
-              echo "Planner HTTP status: $http_status"
+              status="$(curl -sS -o ai_plan.raw -w "%{http_code}" \
+                        -X POST "$AI_PLANNER_URL/plan" \
+                        -H "Content-Type: application/json" \
+                        --data-binary @context.json)"
+              echo "Planner HTTP status: $status"
               echo "---- planner raw (first 400 bytes) ----"
               head -c 400 ai_plan.raw || true; echo
               echo "---------------------------------------"
 
-              # If 200 and looks like JSON, accept; otherwise fallback
-              if [ "$http_status" = "200" ] && [ "$(head -c1 ai_plan.raw || echo x)" = "{" ]; then
-                jq -e . ai_plan.raw > ai_plan.json
-                jq -c . ai_plan.raw > ai_plan.lock.json
+              # If 200 and valid JSON -> accept; else generate a safe fallback.
+              if [ "$status" = "200" ] && jq -e . ai_plan.raw >/dev/null 2>&1; then
+                mv ai_plan.raw ai_plan.lock.json
+                jq . ai_plan.lock.json > ai_plan.json
               else
-                echo "Planner failed or returned non-JSON. Falling back to a safe default plan."
-                cat > ai_plan.json <<'JSON'
-              {
-                "stages": [
-                  { "name": "Checkout Code",       "command": "echo \\"Repo: ${REPO_NAME}, branch: ${BRANCH}, build: ${BUILD_NUMBER}\\"" },
-                  { "name": "Install Dependencies","command": "npm ci --prefer-offline || npm install --prefer-offline || true" },
-                  { "name": "Build Project",       "command": "npm run build || echo \\"No build script, skipping.\\"" },
-                  { "name": "Run Unit Tests",      "command": "npm test || echo \\"No tests, skipping.\\"" }
-                ]
-              }
-              JSON
-                jq -c . ai_plan.json > ai_plan.lock.json
+                echo "Planner failed or returned non-JSON. Using fallback plan."
+                printf '%s' \
+                '{"stages":[
+                  {"name":"Checkout Code","command":"echo \\"Repo: ${REPO_NAME}, branch: ${BRANCH}, build: ${BUILD_NUMBER}\\""},
+                  {"name":"Install Dependencies","command":"npm ci --prefer-offline || npm install --prefer-offline || true"},
+                  {"name":"Build Project","command":"npm run build || echo \\"No build script, skipping.\\""},
+                  {"name":"Run Unit Tests","command":"npm test || echo \\"No tests, skipping.\\""}
+                ]}' > ai_plan.lock.json
+                jq . ai_plan.lock.json > ai_plan.json
               fi
             '''
           }

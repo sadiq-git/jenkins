@@ -63,7 +63,7 @@ pipeline {
               cat > ai_plan.lock.json <<'JSON'
               {
                 "stages":[
-                  { "name":"Checkout Code",        "command":"echo \\"Repo: $${REPO_NAME}, branch: $${BRANCH}, build: $${BUILD_NUMBER}\\"" },
+                  { "name":"Checkout Code",        "command":"echo \\"Repo: ${REPO_NAME}, branch: ${BRANCH}, build: ${BUILD_NUMBER}\\"" },
                   { "name":"Install Dependencies", "command":"npm ci --prefer-offline || npm install --prefer-offline || true" },
                   { "name":"Build Project",        "command":"npm run build || echo \\"No build script, skipping.\\"" },
                   { "name":"Run Unit Tests",       "command":"npm test || echo \\"No tests, skipping.\\"" }

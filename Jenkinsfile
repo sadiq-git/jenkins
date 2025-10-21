@@ -69,13 +69,10 @@ pipeline {
     stage('Execute Plan (Node)') {
       steps {
         script {
-          // Requires docker CLI in Jenkins container + /var/run/docker.sock mounted
-          docker.image('node:20-bookworm-slim').inside('-u 0:0') {
+          // Uses your prebuilt image with git/curl/jq/etc. baked in
+          docker.image('node-ci:20-bookworm-slim').inside('-u 0:0') {
             sh '''
               set -e
-              apt-get update -y
-              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                git ca-certificates python3 make g++ curl jq
               mkdir -p "$NPM_CONFIG_CACHE"
               if [ -f package-lock.json ]; then
                 npm ci --no-audit --prefer-offline || true

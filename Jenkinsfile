@@ -45,72 +45,40 @@ pipeline {
     stage('AI Planning (Gemini)') {
       steps {
         script {
-          timeout(time: 90, unit: 'SECONDS') {
-            retry(2) {
-              docker.image('node-ci:20-bookworm-slim').inside('-u 0:0') {
-                sh '''
-                  set -eu pipefail
+          docker.image('node-ci:20-bookworm-slim').inside('-u 0:0') {
+            sh label: 'Request plan from AI', script: '''
+              bash -lc '
+                set -euo pipefail
+                echo "Requesting plan from $AI_PLANNER_URL"
+                curl -sS -o ai_plan.raw -w "%{http_code}" \
+                  -X POST "$AI_PLANNER_URL/plan" \
+                  -H "Content-Type: application/json" \
+                  --data-binary @context.json > .http_status
 
-                  # Call planner
-                  status=$(curl -sS -o ai_plan.raw -w "%{http_code}" \
-                    -X POST "$AI_PLANNER_URL/plan" \
-                    -H 'Content-Type: application/json' \
-                    --data-binary @context.json)
+                status=$(cat .http_status); echo "Planner HTTP status: $status"
+                echo "---- planner raw (first 400 bytes) ----"
+                head -c 400 ai_plan.raw || true; echo
+                echo "---------------------------------------"
 
-                  echo "Planner HTTP status: $status"
-                  echo "---- planner raw (first 400 bytes) ----"
-                  head -c 400 ai_plan.raw || true
-                  echo
-                  echo "---------------------------------------"
-
-                  # Try the fast path: valid JSON already?
-                  if jq -e . ai_plan.raw >/dev/null 2>&1; then
-                    jq . ai_plan.raw > ai_plan.json
-                    exit 0
-                  fi
-
-                  # Fallback: extract the last balanced JSON object with Python
-                  python3 - <<'PY'
-                  import json, pathlib
-                  s = pathlib.Path("ai_plan.raw").read_text(encoding="utf-8", errors="ignore")
-                  best = None
-                  end = len(s) - 1
-                  while end >= 0 and s[end].isspace(): end -= 1
-                  for i in range(end, -1, -1):
-                      if s[i] == '}':
-                          depth = 0
-                          for j in range(i, -1, -1):
-                              if s[j] == '}': depth += 1
-                              elif s[j] == '{':
-                                  depth -= 1
-                                  if depth == 0:
-                                      best = s[j:i+1]
-                                      break
-                          if best: break
-                  if not best:
-                      raise SystemExit("No JSON object found at end of response")
-                  obj = json.loads(best)
-                  pathlib.Path("ai_plan.json").write_text(json.dumps(obj), encoding="utf-8")
-                  PY
-
-                  # Validate the cleaned JSON
-                  jq . ai_plan.json >/dev/null
-                '''
-              }
-            }
+                python3 - <<PY
+                import json, sys
+                raw = open("ai_plan.raw","rb").read().decode("utf-8","ignore").strip()
+                try:
+                    data = json.loads(raw)
+                except Exception as e:
+                    print("!! JSON parse failed:", e)
+                    print("Raw head:", raw[:400])
+                    sys.exit(1)
+                open("ai_plan.json","w").write(json.dumps(data, indent=2))
+                open("ai_plan.lock.json","w").write(json.dumps(data))
+                PY
+              '
+            '''
           }
-
-          // Show + lock the plan
-          def plan = readJSON file: 'ai_plan.json'
-          echo "AI Suggested Plan:"
-          plan.stages.eachWithIndex { stg, i ->
-            echo String.format("  %02d) %s  ::  %s", i+1, stg.name, stg.command)
-          }
-          writeFile file: 'ai_plan.lock.json', text: groovy.json.JsonOutput.toJson(plan)
         }
       }
     }
-    
+
     stage('Execute Plan (Node)') {
       steps {
         script {

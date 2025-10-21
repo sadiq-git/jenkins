@@ -45,7 +45,10 @@ pipeline {
     stage('AI Planning (Gemini)') {
       steps {
         script {
-          docker.image('node-ci:20-bookworm-slim').inside('-u 0:0') {
+          // Share Jenkins container's network so "ai-planner" DNS works
+          def netOpt = "--network container:${env.HOSTNAME}"
+
+          docker.image('node-ci:20-bookworm-slim').inside("${netOpt} -u 0:0") {
             sh label: 'Request plan from AI', script: '''
               bash -lc '
                 set -euo pipefail
@@ -66,9 +69,7 @@ pipeline {
                 try:
                     data = json.loads(raw)
                 except Exception as e:
-                    print("!! JSON parse failed:", e)
-                    print("Raw head:", raw[:400])
-                    sys.exit(1)
+                    print("!! JSON parse failed:", e); print("Raw head:", raw[:400]); sys.exit(1)
                 open("ai_plan.json","w").write(json.dumps(data, indent=2))
                 open("ai_plan.lock.json","w").write(json.dumps(data))
                 PY

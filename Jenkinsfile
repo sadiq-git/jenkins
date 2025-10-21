@@ -29,7 +29,7 @@ pipeline {
       }
     }
 
-    stage('AI Planning (Gemini)) {
+    stage('AI Planning (Gemini)') {
       steps {
         script {
           timeout(time: 90, unit: 'SECONDS') {

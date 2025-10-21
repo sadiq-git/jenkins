@@ -1,0 +1,8 @@
+
+Flask==3.0.3
+google-genai>=0.1.0
+pydantic==2.8.2
+jsonschema==4.23.0
+uvicorn==0.30.5
+gunicorn==22.0.0
+pytest==8.3.2

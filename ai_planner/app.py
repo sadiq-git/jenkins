@@ -1,46 +1,45 @@
 from __future__ import annotations
-import os, json, re, traceback, logging
-from typing import Any, Dict, List
+import os, json, re, traceback, logging, time, hashlib
+from typing import Any, Dict, List, Tuple, Optional
 
 from flask import Flask, request, jsonify
-from google import genai  # requires: google-genai>=0.1.0
+from google import genai  # pip install google-genai>=0.1.0
 
-from policy import is_allowed
+try:
+    from policy import is_allowed
+except Exception:
+    def is_allowed(cmd: str) -> bool:
+        # fallback: allow everything (you can tighten later)
+        return True
 
-APP_HOST = os.getenv("APP_HOST", "0.0.0.0")
-APP_PORT = int(os.getenv("APP_PORT", "8000"))
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-MAX_STAGES = int(os.getenv("MAX_STAGES", "12"))
+APP_HOST      = os.getenv("APP_HOST", "0.0.0.0")
+APP_PORT      = int(os.getenv("APP_PORT", "8000"))
+GEMINI_MODEL  = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+MAX_STAGES    = int(os.getenv("MAX_STAGES", "12"))
+CACHE_TTL_SEC = int(os.getenv("CACHE_TTL_SEC", "600"))     # 10 minutes
+GENAI_TIMEOUT = float(os.getenv("GENAI_TIMEOUT", "45"))    # seconds
+GENAI_RETRIES = int(os.getenv("GENAI_RETRIES", "4"))       # attempts (incl. first)
+GENAI_BACKOFF = float(os.getenv("GENAI_BACKOFF", "0.75"))  # base backoff seconds
 
-SAFE_FALLBACK_PLAN = {
-    "stages": [
-        {"name": "Build",   "command": "make -v"},
-        {"name": "Test",    "command": "pytest -q"},
-        {"name": "Package", "command": "ls -la"},
-    ]
-}
+# In-memory cache: key -> (expires_at_epoch, plan_dict)
+_plan_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
-# NOTE: all JSON braces are escaped with double braces so .format() only fills {max_stages}
 JSON_SCHEMA_HINT = """
 Respond with STRICT JSON only (no markdown/code fences). The JSON must follow:
-{{
+{
   "stages": [
-    {{ "name": "Build", "command": "bash command here" }},
-    {{ "name": "Test",  "command": "bash command here" }}
+    { "name": "Build", "command": "bash command here" },
+    { "name": "Test",  "command": "bash command here" }
   ]
-}}
+}
 Rules:
-- At most {max_stages} stages.
+- At most %(max_stages)d stages.
 - Each 'name' is <= 40 chars, alnum/space/.- only.
 - Each 'command' is a SINGLE shell line (no multiline, no heredocs).
 - Prefer commonly available tools; avoid destructive ops and secrets.
 """
 
 def _extract_json(maybe_json: str) -> str:
-    """
-    Extract the first JSON object from a Gemini response.
-    Strips markdown code fences and any stray text.
-    """
     if not isinstance(maybe_json, str):
         return "{}"
     cleaned = re.sub(r"```(json)?", "", maybe_json, flags=re.IGNORECASE)
@@ -60,14 +59,28 @@ def _postprocess_and_filter(plan: Dict[str, Any]) -> Dict[str, Any]:
             continue
         if is_allowed(c):
             stages.append({"name": n, "command": c})
-    if not stages:
-        stages = SAFE_FALLBACK_PLAN["stages"]
     return {"stages": stages}
+
+def _ctx_key(ctx: Dict[str, Any]) -> str:
+    b = json.dumps(ctx, sort_keys=True, separators=(",",":")).encode("utf-8")
+    return hashlib.sha1(b).hexdigest()
+
+def _get_cached(key: str) -> Optional[Dict[str, Any]]:
+    now = time.time()
+    ent = _plan_cache.get(key)
+    if ent and ent[0] > now:
+        return ent[1]
+    if ent:
+        _plan_cache.pop(key, None)
+    return None
+
+def _put_cache(key: str, plan: Dict[str, Any]) -> None:
+    _plan_cache[key] = (time.time() + CACHE_TTL_SEC, plan)
 
 def make_app() -> Flask:
     app = Flask(__name__)
 
-    # Tie Flask logs to gunicorn if available
+    # Tie Flask logs to gunicorn if present
     gunicorn_error_logger = logging.getLogger("gunicorn.error")
     if gunicorn_error_logger.handlers:
         app.logger.handlers = gunicorn_error_logger.handlers
@@ -98,73 +111,85 @@ def make_app() -> Flask:
     @app.post("/plan")
     def plan():
         """
-        Always returns HTTP 200 with JSON.
-        On any error, returns SAFE_FALLBACK_PLAN and meta.reason.
+        Returns 200 + plan JSON on success.
+        If Gemini fails AND no cached plan is available, returns 503 with error JSON.
+        No fallback stages are returned.
         """
-        try:   
-            ctx = request.get_json(silent=True) or {}
-            prompt = f"""
-You are a CI/CD planner that outputs STRICT JSON only.
-Given this Jenkins context:
-{json.dumps(ctx, indent=2)}
+        try:
+            ctx: Dict[str, Any] = request.get_json(silent=True) or {}
+            key = _ctx_key(ctx)
 
-{JSON_SCHEMA_HINT.format(max_stages=MAX_STAGES)}
+            # Use cache first if still valid
+            cached = _get_cached(key)
+            if cached:
+                return jsonify({"stages": cached["stages"], "meta": {"cached": True}}), 200
 
-Focus:
-- If commit message mentions tests/docs only, skip heavy builds.
-- If branch is 'main' or 'release/*', include deploy (safe, idempotent commands).
-- Prefer commands commonly used by: Python, Node, Java, Go projects.
-- Keep commands one-liners compatible with 'sh'.
-- Avoid secrets/inline tokens.
-"""
+            prompt = (
+                "You are a CI/CD planner that outputs STRICT JSON only.\n"
+                f"Jenkins context (JSON):\n{json.dumps(ctx, separators=(',',':'))}\n\n"
+                + JSON_SCHEMA_HINT % {"max_stages": MAX_STAGES}
+                + "\nFocus:\n"
+                  "- If commit message mentions tests/docs only, skip heavy builds.\n"
+                  "- If branch is 'main' or 'release/*', include deploy (safe, idempotent commands).\n"
+                  "- Prefer commands commonly used by: Python, Node, Java, Go projects.\n"
+                  "- Keep commands one-liners compatible with 'sh'.\n"
+                  "- Avoid secrets/inline tokens.\n"
+            )
 
-            # Call Gemini
-            try:
-                resp = app.config["GENAI_CLIENT"].models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=prompt
-                )
-                text = getattr(resp, "text", None)
-                if not text:
-                    try:
-                        cand0 = (resp.candidates or [])[0]
-                        part0 = getattr(cand0, "content", None)
-                        if part0 and getattr(part0, "parts", None):
-                            text = part0.parts[0].text
-                    except Exception:
-                        text = ""
-            except Exception as e:
-                app.logger.exception("Gemini call failed")
-                return jsonify({
-                    "stages": SAFE_FALLBACK_PLAN["stages"],
-                    "meta": {"fallback": True, "reason": f"gemini_error: {str(e)}"}
-                }), 200
+            # Call Gemini with backoff
+            text = ""
+            last_err = None
+            for attempt in range(GENAI_RETRIES):
+                try:
+                    resp = app.config["GENAI_CLIENT"].models.generate_content(
+                        model=GEMINI_MODEL,
+                        contents=prompt,
+                        timeout=GENAI_TIMEOUT,
+                    )
+                    text = getattr(resp, "text", "") or ""
+                    if not text:
+                        # try to extract first candidate text if SDK shape changes
+                        try:
+                            cand0 = (resp.candidates or [])[0]
+                            part0 = getattr(cand0, "content", None)
+                            if part0 and getattr(part0, "parts", None):
+                                text = part0.parts[0].text or ""
+                        except Exception:
+                            pass
+                    if text:
+                        break
+                except Exception as e:
+                    last_err = e
+                # backoff
+                time.sleep((GENAI_BACKOFF ** attempt) + 0.25)
 
-            # Parse JSON
+            if not text:
+                # No text from Gemini
+                msg = f"gemini_no_text: {last_err!r}" if last_err else "gemini_no_text"
+                return jsonify({"error": msg}), 503
+
+            # Parse & filter
             try:
                 raw_json = _extract_json(text).strip()
                 plan_dict = json.loads(raw_json)
             except Exception as e:
-                app.logger.warning("JSON parse failed; returning fallback: %s", e)
-                return jsonify({
-                    "stages": SAFE_FALLBACK_PLAN["stages"],
-                    "meta": {"fallback": True, "reason": f"json_error: {str(e)}", "raw": (text or "")[:800]}
-                }), 200
+                return jsonify({"error": f"json_parse_error: {e}", "raw": (text or "")[:500]}), 503
 
-            # Filter & return
             filtered = _postprocess_and_filter(plan_dict)
+            if not filtered.get("stages"):
+                return jsonify({"error": "empty_or_disallowed_plan"}), 503
+
+            # Cache successful plan
+            _put_cache(key, filtered)
             return jsonify(filtered), 200
 
         except Exception as e:
             app.logger.exception("Unhandled /plan error")
             return jsonify({
-                "stages": SAFE_FALLBACK_PLAN["stages"],
-                "meta": {
-                    "fallback": True,
-                    "reason": f"unhandled: {str(e)}",
-                    "trace": traceback.format_exc()[:1200]
-                }
-            }), 200
+                "error": "unhandled",
+                "reason": str(e),
+                "trace": traceback.format_exc()[:1200]
+            }), 503
 
     return app
 

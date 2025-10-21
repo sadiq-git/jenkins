@@ -45,10 +45,10 @@ pipeline {
       }
     }
 
-    stage('AI Planning (Gemini)') {
+    stage('AI Planning (Gemini))') {
       steps {
         script {
-          // Share Jenkins container network so "ai-planner" resolves
+          // Share Jenkins container network so the hostname "ai-planner" resolves
           def netOpt = "--network container:${env.HOSTNAME}"
 
           docker.image('node-ci:20-bookworm-slim').inside("${netOpt} -u 0:0") {
@@ -57,18 +57,23 @@ pipeline {
 
               echo "Requesting plan from $AI_PLANNER_URL"
 
-              # Quick health check
+              # Quick health check against planner's /healthz endpoint
               if ! curl -fsS --connect-timeout 3 --max-time 5 "$AI_PLANNER_URL/healthz" >/dev/null; then
                 echo "Planner health check failed; using fallback plan."
-                cat > ai_plan.lock.json <<'JSON'
-                {"stages":[
-                  {"name":"Checkout Code","command":"echo \\"Repo: ${REPO_NAME}, branch: ${BRANCH}, build: ${BUILD_NUMBER}\\""},
-                  {"name":"Install Dependencies","command":"npm ci --prefer-offline || npm install --prefer-offline || true"},
-                  {"name":"Build Project","command":"npm run build || echo \\"No build script, skipping.\\""},
-                  {"name":"Run Unit Tests","command":"npm test || echo \\"No tests, skipping.\\""}
-                ]}
-                JSON
-                jq . ai_plan.lock.json > ai_plan.json
+                # Build fallback JSON safely with jq (no heredocs)
+                jq -n \
+                  --arg re "$REPO_NAME" \
+                  --arg br "$BRANCH" \
+                  --arg bn "$BUILD_NUMBER" \
+                  '
+                  {
+                    stages: [
+                      {name:"Checkout Code",       command: ("echo \\"Repo: " + $re + ", branch: " + $br + ", build: " + $bn + "\\"")},
+                      {name:"Install Dependencies", command: "npm ci --prefer-offline || npm install --prefer-offline || true"},
+                      {name:"Build Project",        command: "npm run build || echo \\"No build script, skipping.\\""},
+                      {name:"Run Unit Tests",       command: "npm test || echo \\"No tests, skipping.\\""}
+                    ]
+                  }' | tee ai_plan.lock.json | jq . > ai_plan.json
                 echo "health-check-failed" > .http_status
                 exit 0
               fi
@@ -81,7 +86,10 @@ pipeline {
                            -X POST "$AI_PLANNER_URL/plan" \
                            -H "Content-Type: application/json" \
                            --data-binary @context.json || true)"
-                [ "$status" = "200" ] && jq -e . ai_plan.raw >/dev/null 2>&1 && break || sleep 2
+                if [ "$status" = "200" ] && jq -e . ai_plan.raw >/dev/null 2>&1; then
+                  break
+                fi
+                sleep 2
               done
               echo "$status" > .http_status
 
@@ -95,15 +103,19 @@ pipeline {
                 jq . ai_plan.lock.json > ai_plan.json
               else
                 echo "Planner failed or returned non-JSON. Using fallback plan."
-                cat > ai_plan.lock.json <<'JSON'
-                {"stages":[
-                  {"name":"Checkout Code","command":"echo \\"Repo: ${REPO_NAME}, branch: ${BRANCH}, build: ${BUILD_NUMBER}\\""},
-                  {"name":"Install Dependencies","command":"npm ci --prefer-offline || npm install --prefer-offline || true"},
-                  {"name":"Build Project","command":"npm run build || echo \\"No build script, skipping.\\""},
-                  {"name":"Run Unit Tests","command":"npm test || echo \\"No tests, skipping.\\""}
-                ]}
-                JSON
-                jq . ai_plan.lock.json > ai_plan.json
+                jq -n \
+                  --arg re "$REPO_NAME" \
+                  --arg br "$BRANCH" \
+                  --arg bn "$BUILD_NUMBER" \
+                  '
+                  {
+                    stages: [
+                      {name:"Checkout Code",       command: ("echo \\"Repo: " + $re + ", branch: " + $br + ", build: " + $bn + "\\"")},
+                      {name:"Install Dependencies", command: "npm ci --prefer-offline || npm install --prefer-offline || true"},
+                      {name:"Build Project",        command: "npm run build || echo \\"No build script, skipping.\\""},
+                      {name:"Run Unit Tests",       command: "npm test || echo \\"No tests, skipping.\\""}
+                    ]
+                  }' | tee ai_plan.lock.json | jq . > ai_plan.json
               fi
             '''
           }

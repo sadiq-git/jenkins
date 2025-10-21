@@ -1,23 +1,26 @@
 pipeline {
   agent any
-  options { timestamps(); ansiColor('xterm') }
+  options {
+    timestamps()
+    ansiColor('xterm')
+    skipDefaultCheckout(true)   // <— turn off the implicit "Declarative: Checkout SCM"
+  }
   environment {
     AI_PLANNER_URL = 'http://ai-planner:8000'
     NPM_CONFIG_CACHE = "${WORKSPACE}/.npm"
     CI = "true"
   }
+
   stages {
     stage('Checkout') {
-        steps {
-          script {
-            // ensure the workspace is empty (avoids half-baked .git dirs)
-            deleteDir()
-          }
-          // simple declarative git step does init + fetch + checkout
-          git url: 'https://github.com/sadiq-git/jenkins', branch: 'master'
+      steps {
+        script {
+          deleteDir()  // ensure no half-baked .git from old runs
+        }
+        // Initialize repo cleanly; avoids the "not in a git directory" error
+        git url: 'https://github.com/sadiq-git/jenkins', branch: 'master'
       }
     }
-
 
     stage('Collect Context') {
       steps {
@@ -25,7 +28,7 @@ pipeline {
           def branchGuess = sh(
             script: "git symbolic-ref -q --short HEAD || git name-rev --name-only HEAD || echo master",
             returnStdout: true
-          ).trim()
+          ).trim().replaceFirst(/^remotes\\/origin\\//,'')
           if (!branchGuess || branchGuess == 'HEAD') branchGuess = 'master'
           def ctx = [
             branch: branchGuess,
@@ -58,7 +61,6 @@ pipeline {
           plan.stages.eachWithIndex { stg, i ->
             echo String.format("  %02d) %s  ::  %s", i+1, stg.name, stg.command)
           }
-          // Keep the JSON available for the next stage
           writeFile file: 'ai_plan.lock.json', text: groovy.json.JsonOutput.toJson(plan)
         }
       }
@@ -67,6 +69,7 @@ pipeline {
     stage('Execute Plan (Node)') {
       steps {
         script {
+          // Requires docker CLI in Jenkins container + /var/run/docker.sock mounted
           docker.image('node:20-bookworm-slim').inside('-u 0:0') {
             sh '''
               set -e
@@ -91,7 +94,10 @@ pipeline {
       }
     }
   }
+
   post {
-    always { archiveArtifacts artifacts: 'context.json, ai_plan.json, ai_plan.lock.json', onlyIfSuccessful: false }
+    always {
+      archiveArtifacts artifacts: 'context.json, ai_plan.json, ai_plan.lock.json', onlyIfSuccessful: false
+    }
   }
 }

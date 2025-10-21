@@ -1,13 +1,17 @@
 
 services:
   jenkins:
-    image: jenkins/jenkins:lts-jdk17
+    build:
+      context: .
+      dockerfile: jenkins/Dockerfile
     container_name: jenkins
     ports:
       - "8080:8080"
     volumes:
       - ./jenkins_home:/var/jenkins_home
       - /var/run/docker.sock:/var/run/docker.sock
+    # If you run into socket permission issues, uncomment the next line:
+    user: "0:0"
     environment:
       - JAVA_OPTS=-Djenkins.install.runSetupWizard=false
     restart: unless-stopped

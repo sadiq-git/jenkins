@@ -7,7 +7,17 @@ pipeline {
     CI = "true"
   }
   stages {
-    stage('Checkout') { steps { checkout scm } }
+    stage('Checkout') {
+        steps {
+          script {
+            // ensure the workspace is empty (avoids half-baked .git dirs)
+            deleteDir()
+          }
+          // simple declarative git step does init + fetch + checkout
+          git url: 'https://github.com/sadiq-git/jenkins', branch: 'master'
+      }
+    }
+
 
     stage('Collect Context') {
       steps {

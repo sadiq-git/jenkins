@@ -8,18 +8,17 @@ pipeline {
   }
 
   environment {
-    // Talk to the planner via the host-published port (works for Option A)
+    // Talking to planner on the host (your Option A)
     AI_PLANNER_URL = 'http://host.docker.internal:8000'
     NPM_CONFIG_CACHE = "${WORKSPACE}/.npm"
     CI = "true"
   }
 
   stages {
-
     stage('Checkout') {
       steps {
         script {
-          deleteDir() // ensure a clean workspace
+          deleteDir() // clean workspace
         }
         git url: 'https://github.com/sadiq-git/jenkins', branch: 'master'
       }
@@ -49,60 +48,18 @@ pipeline {
     stage('AI Planning (Gemini)') {
       steps {
         script {
-          // Add host.docker.internal for Linux; harmless elsewhere
+          // Add host.docker.internal for Linux; harmless on Mac/Win
           def dockerNetOpts = '--add-host=host.docker.internal:host-gateway -u 0:0'
 
-          def plannerScript = """
+          // IMPORTANT: single-quoted triple quotes so $... is NOT interpolated by Groovy
+          def plannerScript = '''
             set -e
 
-            echo "Requesting plan from \$AI_PLANNER_URL"
+            echo "Requesting plan from $AI_PLANNER_URL"
 
-            # 1) quick health check (don’t -f; we want non-200 statuses too)
-            if ! curl -sS --connect-timeout 3 --max-time 5 "\$AI_PLANNER_URL/healthz" >/dev/null; then
+            # 1) Quick health check (don’t -f; we want to see non-200 too)
+            if ! curl -sS --connect-timeout 3 --max-time 5 "$AI_PLANNER_URL/healthz" >/dev/null; then
               echo "Planner health check failed; using fallback plan."
-              cat > ai_plan.lock.json <<'JSON'
-              {
-                "stages":[
-                  { "name":"Checkout Code",        "command":"echo \\"Repo: ${REPO_NAME}, branch: ${BRANCH}, build: ${BUILD_NUMBER}\\"" },
-                  { "name":"Install Dependencies", "command":"npm ci --prefer-offline || npm install --prefer-offline || true" },
-                  { "name":"Build Project",        "command":"npm run build || echo \\"No build script, skipping.\\"" },
-                  { "name":"Run Unit Tests",       "command":"npm test || echo \\"No tests, skipping.\\"" }
-                ]
-              }
-              JSON
-              jq . ai_plan.lock.json > ai_plan.json
-              echo "health-check-failed" > .http_status
-              exit 0
-            fi
-
-            # 2) ask /plan with generous timeout + retries (LLMs can be slow)
-            status=""
-            attempt=0
-            for delay in 0 2 4; do
-              attempt=\$((attempt+1))
-              [ \$delay -gt 0 ] && sleep "\$delay"
-              status="\$(curl -sS -o ai_plan.raw -w "%{http_code}" \
-                         --connect-timeout 5 --max-time 60 \
-                         -X POST "\$AI_PLANNER_URL/plan" \
-                         -H "Content-Type: application/json" \
-                         --data-binary @context.json || true)"
-              if [ "\$status" = "200" ] && jq -e . ai_plan.raw >/dev/null 2>&1; then
-                break
-              fi
-            done
-            echo "\$status" > .http_status
-
-            echo "Planner HTTP status: \$status"
-            echo "---- planner raw (first 400 bytes) ----"
-            [ -f ai_plan.raw ] && head -c 400 ai_plan.raw || echo "(no body)"
-            echo
-            echo "---------------------------------------"
-
-            if [ "\$status" = "200" ] && jq -e . ai_plan.raw >/devnull 2>&1; then
-              mv ai_plan.raw ai_plan.lock.json
-              jq . ai_plan.lock.json > ai_plan.json
-            else
-              echo "Planner failed or returned non-JSON. Using fallback plan."
               cat > ai_plan.lock.json <<'JSON'
               {
                 "stages":[
@@ -114,8 +71,49 @@ pipeline {
               }
               JSON
               jq . ai_plan.lock.json > ai_plan.json
+              echo "health-check-failed" > .http_status
+              exit 0
             fi
-          """.stripIndent()
+
+            # 2) Ask /plan with generous timeout + retries
+            status=""
+            for delay in 0 2 4; do
+              [ "$delay" -gt 0 ] && sleep "$delay"
+              status="$(curl -sS -o ai_plan.raw -w "%{http_code}" \
+                         --connect-timeout 5 --max-time 60 \
+                         -X POST "$AI_PLANNER_URL/plan" \
+                         -H "Content-Type: application/json" \
+                         --data-binary @context.json || true)"
+              if [ "$status" = "200" ] && jq -e . ai_plan.raw >/dev/null 2>&1; then
+                break
+              fi
+            done
+            echo "$status" > .http_status
+
+            echo "Planner HTTP status: $status"
+            echo "---- planner raw (first 400 bytes) ----"
+            [ -f ai_plan.raw ] && head -c 400 ai_plan.raw || echo "(no body)"
+            echo
+            echo "---------------------------------------"
+
+            if [ "$status" = "200" ] && jq -e . ai_plan.raw >/dev/null 2>&1; then
+              mv ai_plan.raw ai_plan.lock.json
+              jq . ai_plan.lock.json > ai_plan.json
+            else
+              echo "Planner failed or returned non-JSON. Using fallback plan."
+              cat > ai_plan.lock.json <<'JSON'
+{
+  "stages":[
+    { "name":"Checkout Code",        "command":"echo \\"Repo: $${REPO_NAME}, branch: $${BRANCH}, build: $${BUILD_NUMBER}\\"" },
+    { "name":"Install Dependencies", "command":"npm ci --prefer-offline || npm install --prefer-offline || true" },
+    { "name":"Build Project",        "command":"npm run build || echo \\"No build script, skipping.\\"" },
+    { "name":"Run Unit Tests",       "command":"npm test || echo \\"No tests, skipping.\\"" }
+  ]
+}
+JSON
+              jq . ai_plan.lock.json > ai_plan.json
+            fi
+          '''.stripIndent()
 
           docker.image('node-ci:20-bookworm-slim').inside(dockerNetOpts) {
             sh label: 'Request plan from AI', script: plannerScript
@@ -127,7 +125,6 @@ pipeline {
     stage('Execute Plan (Node)') {
       steps {
         script {
-          // Export env vars used inside the plan commands
           def ctx = readJSON file: 'context.json'
           withEnv([
             "BRANCH=${ctx.branch}",

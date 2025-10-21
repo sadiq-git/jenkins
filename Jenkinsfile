@@ -5,13 +5,15 @@ pipeline {
     timestamps()
     ansiColor('xterm')
     skipDefaultCheckout(true) // disable implicit "Declarative: Checkout SCM"
-    disableConcurrentBuilds()
   }
 
   environment {
-    // A) Same Docker network (Compose): service name works
+    // Pick ONE endpoint style:
+
+    // A) If Jenkins & planner containers share the same Docker network (Compose service name `ai-planner`)
     AI_PLANNER_URL = 'http://ai-planner:8000'
-    // B) Or, if planner is on the host (Docker Desktop):
+
+    // B) If you want to hit a planner that’s bound to the host:
     // AI_PLANNER_URL = 'http://host.docker.internal:8000'
 
     NPM_CONFIG_CACHE = "${WORKSPACE}/.npm"
@@ -50,27 +52,26 @@ pipeline {
     stage('AI Planning (Gemini)') {
       steps {
         script {
-          // Networking:
-          // A) If Jenkins runs in a container on the SAME network as ai-planner:
+          // Network option A: share Jenkins container network namespace (best if using service name ai-planner)
           def dockerNetOpts = "--network container:${env.HOSTNAME} -u 0:0"
-          // B) If you need to call planner on host:
+          // Option B (if using host.docker.internal):
           // def dockerNetOpts = "--add-host=host.docker.internal:host-gateway -u 0:0"
 
-          // Single-quoted => env vars expand inside the container shell, not by Groovy.
+          // Single-quoted, so $VARS are expanded by the shell inside the container, not by Groovy.
           def plannerScript = '''
             set -eu
 
             echo "Planner URL: $AI_PLANNER_URL"
 
-            # Health check; must be 200
+            # Health check; require 200
             hc="$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 5 "$AI_PLANNER_URL/healthz" || true)"
             echo "Planner /healthz HTTP: ${hc:-<none>}"
             if [ "$hc" != "200" ]; then
-              echo "ERROR: Planner health check failed ($hc)."
+              echo "ERROR: Planner health check failed (got '$hc')."
               exit 2
             fi
 
-            # Request plan with small retry window (to survive brief model hiccups)
+            # Request plan (exponential-ish backoff for transient overloads)
             status=""
             for delay in 0 2 4; do
               [ "$delay" -gt 0 ] && sleep "$delay"
@@ -79,26 +80,25 @@ pipeline {
                         -X POST "$AI_PLANNER_URL/plan" \
                         -H 'Content-Type: application/json' \
                         --data-binary @context.json || true)"
-              # Accept only JSON 200 with stages array
-              if [ "$status" = "200" ] && jq -e '.stages and (.stages|type=="array")' ai_plan.raw >/dev/null 2>&1; then
+              if [ "$status" = "200" ] && jq -e . ai_plan.raw >/dev/null 2>&1; then
                 break
               fi
             done
             echo "$status" > .http_status
+
             echo "Planner /plan HTTP: $status"
             echo "---- planner raw (first 400 bytes) ----"
             if [ -f ai_plan.raw ]; then head -c 400 ai_plan.raw; else echo "(no body)"; fi
             echo
             echo "---------------------------------------"
 
-            # Hard fail if not OK (no fallback)
             if [ "$status" != "200" ]; then
               echo "ERROR: Planner returned non-200 ($status)."
               exit 3
             fi
 
-            if ! jq -e '.stages and (.stages|type=="array")' ai_plan.raw >/dev/null 2>&1; then
-              echo "ERROR: Planner did not return a valid plan."
+            if ! jq -e . ai_plan.raw >/dev/null 2>&1; then
+              echo "ERROR: Planner did not return valid JSON."
               exit 4
             fi
 

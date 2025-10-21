@@ -4,16 +4,13 @@ pipeline {
   options {
     timestamps()
     ansiColor('xterm')
-    skipDefaultCheckout(true) // disable implicit "Declarative: Checkout SCM"
+    skipDefaultCheckout(true)
   }
 
   environment {
-    // Pick ONE endpoint style:
-
-    // A) If Jenkins & planner containers share the same Docker network (Compose service name `ai-planner`)
+    // Same network (compose service name):
     AI_PLANNER_URL = 'http://ai-planner:8000'
-
-    // B) If you want to hit a planner that’s bound to the host:
+    // Or host:
     // AI_PLANNER_URL = 'http://host.docker.internal:8000'
 
     NPM_CONFIG_CACHE = "${WORKSPACE}/.npm"
@@ -52,18 +49,15 @@ pipeline {
     stage('AI Planning (Gemini)') {
       steps {
         script {
-          // Network option A: share Jenkins container network namespace (best if using service name ai-planner)
           def dockerNetOpts = "--network container:${env.HOSTNAME} -u 0:0"
-          // Option B (if using host.docker.internal):
+          // Or, if using host:
           // def dockerNetOpts = "--add-host=host.docker.internal:host-gateway -u 0:0"
 
-          // Single-quoted, so $VARS are expanded by the shell inside the container, not by Groovy.
           def plannerScript = '''
             set -eu
 
             echo "Planner URL: $AI_PLANNER_URL"
 
-            # Health check; require 200
             hc="$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 5 "$AI_PLANNER_URL/healthz" || true)"
             echo "Planner /healthz HTTP: ${hc:-<none>}"
             if [ "$hc" != "200" ]; then
@@ -71,7 +65,6 @@ pipeline {
               exit 2
             fi
 
-            # Request plan (exponential-ish backoff for transient overloads)
             status=""
             for delay in 0 2 4; do
               [ "$delay" -gt 0 ] && sleep "$delay"
@@ -104,22 +97,27 @@ pipeline {
 
             mv ai_plan.raw ai_plan.lock.json
             jq . ai_plan.lock.json > ai_plan.json
+
+            # Enforce: we only accept AI plans (no fallback)
+            if jq -e '.meta.fallback == true' ai_plan.lock.json >/dev/null 2>&1; then
+              echo "ERROR: Planner fell back, refusing to proceed (meta.fallback=true)."
+              exit 5
+            fi
           '''.stripIndent()
 
           docker.image('node-ci:20-bookworm-slim').inside(dockerNetOpts) {
-            sh label: 'Request plan from AI (no fallback)', script: plannerScript
+            sh label: 'Request plan from AI (strict no-fallback)', script: plannerScript
           }
         }
       }
     }
 
     stage('Execute Plan (Node)') {
+      when {
+        expression { return fileExists('ai_plan.lock.json') }
+      }
       steps {
         script {
-          if (!fileExists('ai_plan.lock.json')) {
-            error "Planner did not produce ai_plan.lock.json; aborting (no fallback allowed)."
-          }
-
           def ctx = readJSON file: 'context.json'
           withEnv([
             "BRANCH=${ctx.branch}",

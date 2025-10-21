@@ -49,7 +49,7 @@ pipeline {
             retry(2) {
               docker.image('node-ci:20-bookworm-slim').inside('-u 0:0') {
                 sh '''
-                  set -euo pipefail
+                  set -eu pipefail
 
                   # Call planner
                   status=$(curl -sS -o ai_plan.raw -w "%{http_code}" \

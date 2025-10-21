@@ -47,15 +47,71 @@ pipeline {
         script {
           timeout(time: 90, unit: 'SECONDS') {
             retry(2) {
-              sh """
-                set -e
-                curl -sS -X POST "$AI_PLANNER_URL/plan" \
+              sh '''
+                set -euo pipefail
+
+                # 1) Call planner and capture RAW body + status
+                status=$(curl -sS -o ai_plan.raw -w "%{http_code}" \
+                  -X POST "$AI_PLANNER_URL/plan" \
                   -H 'Content-Type: application/json' \
-                  --data-binary @context.json > ai_plan.json
-                test -s ai_plan.json
-              """
+                  --data-binary @context.json)
+
+                echo "Planner HTTP status: $status"
+                echo "---- planner raw (first 400 bytes) ----"
+                head -c 400 ai_plan.raw || true
+                echo
+                echo "---------------------------------------"
+
+                # 2) Extract the LAST JSON object from the raw text (handles prose / code fences)
+                python3 - <<'PY'
+                import re, json, sys, pathlib
+                raw = pathlib.Path("ai_plan.raw").read_text(encoding="utf-8", errors="ignore")
+
+                # Try to find a JSON object ending at EOF using a simple brace counter
+                def last_json_object(s):
+                    end = len(s) - 1
+                    # strip trailing whitespace
+                    while end >= 0 and s[end].isspace():
+                        end -= 1
+                    best = None
+                    # scan backwards for a closing brace and attempt to match a balanced object
+                    for i in range(end, -1, -1):
+                        if s[i] == '}':
+                            depth = 0
+                            for j in range(i, -1, -1):
+                                if s[j] == '}': depth += 1
+                                elif s[j] == '{':
+                                    depth -= 1
+                                    if depth == 0:
+                                        best = s[j:i+1]
+                                        break
+                            if best:
+                                break
+                    return best
+
+                snippet = last_json_object(raw)
+                if not snippet:
+                    print("ERROR: No JSON object found at end of response", file=sys.stderr)
+                    sys.exit(2)
+
+                try:
+                    obj = json.loads(snippet)
+                except Exception as e:
+                    print("ERROR: Extracted JSON failed to parse:", e, file=sys.stderr)
+                    print(snippet[:400], file=sys.stderr)
+                    sys.exit(3)
+
+                # Write the cleaned JSON for the next steps
+                pathlib.Path("ai_plan.json").write_text(json.dumps(obj), encoding="utf-8")
+                PY
+
+                            # 3) Validate JSON is actually JSON (pretty-print or fail)
+                            jq . ai_plan.json >/dev/null
+                          '''
             }
           }
+
+          // Show plan and save a locked copy
           def plan = readJSON file: 'ai_plan.json'
           echo "AI Suggested Plan:"
           plan.stages.eachWithIndex { stg, i ->
@@ -65,7 +121,7 @@ pipeline {
         }
       }
     }
-
+    
     stage('Execute Plan (Node)') {
       steps {
         script {

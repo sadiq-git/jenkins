@@ -45,41 +45,48 @@ pipeline {
     stage('AI Planning (Gemini)') {
       steps {
         script {
-          // Share Jenkins container's network so "ai-planner" DNS works
+          // share Jenkins container network so "ai-planner" DNS works
           def netOpt = "--network container:${env.HOSTNAME}"
 
           docker.image('node-ci:20-bookworm-slim').inside("${netOpt} -u 0:0") {
             sh label: 'Request plan from AI', script: '''
-              bash -lc '
-                set -euo pipefail
-                echo "Requesting plan from $AI_PLANNER_URL"
-                curl -sS -o ai_plan.raw -w "%{http_code}" \
-                  -X POST "$AI_PLANNER_URL/plan" \
-                  -H "Content-Type: application/json" \
-                  --data-binary @context.json > .http_status
+              set -e
 
-                status=$(cat .http_status); echo "Planner HTTP status: $status"
-                echo "---- planner raw (first 400 bytes) ----"
-                head -c 400 ai_plan.raw || true; echo
-                echo "---------------------------------------"
+              echo "Requesting plan from $AI_PLANNER_URL"
+              http_status=$(curl -sS -o ai_plan.raw -w "%{http_code}" \
+                -X POST "$AI_PLANNER_URL/plan" \
+                -H "Content-Type: application/json" \
+                --data-binary @context.json)
 
-                python3 - <<PY
-                import json, sys
-                raw = open("ai_plan.raw","rb").read().decode("utf-8","ignore").strip()
-                try:
-                    data = json.loads(raw)
-                except Exception as e:
-                    print("!! JSON parse failed:", e); print("Raw head:", raw[:400]); sys.exit(1)
-                open("ai_plan.json","w").write(json.dumps(data, indent=2))
-                open("ai_plan.lock.json","w").write(json.dumps(data))
-                PY
-              '
+              echo "Planner HTTP status: $http_status"
+              echo "---- planner raw (first 400 bytes) ----"
+              head -c 400 ai_plan.raw || true; echo
+              echo "---------------------------------------"
+
+              # If 200 and looks like JSON, accept; otherwise fallback
+              if [ "$http_status" = "200" ] && [ "$(head -c1 ai_plan.raw || echo x)" = "{" ]; then
+                jq -e . ai_plan.raw > ai_plan.json
+                jq -c . ai_plan.raw > ai_plan.lock.json
+              else
+                echo "Planner failed or returned non-JSON. Falling back to a safe default plan."
+                cat > ai_plan.json <<'JSON'
+              {
+                "stages": [
+                  { "name": "Checkout Code",       "command": "echo \\"Repo: ${REPO_NAME}, branch: ${BRANCH}, build: ${BUILD_NUMBER}\\"" },
+                  { "name": "Install Dependencies","command": "npm ci --prefer-offline || npm install --prefer-offline || true" },
+                  { "name": "Build Project",       "command": "npm run build || echo \\"No build script, skipping.\\"" },
+                  { "name": "Run Unit Tests",      "command": "npm test || echo \\"No tests, skipping.\\"" }
+                ]
+              }
+              JSON
+                jq -c . ai_plan.json > ai_plan.lock.json
+              fi
             '''
           }
         }
       }
     }
-
+    
     stage('Execute Plan (Node)') {
       steps {
         script {

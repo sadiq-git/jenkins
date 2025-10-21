@@ -58,16 +58,16 @@ pipeline {
               echo "Requesting plan from $AI_PLANNER_URL"
 
               # Quick health check
-              if ! curl -fsS --connect-timeout 3 --max-time 5 "$AI_PLANNER_URL/health" >/dev/null; then
+              if ! curl -fsS --connect-timeout 3 --max-time 5 "$AI_PLANNER_URL/healthz" >/dev/null; then
                 echo "Planner health check failed; using fallback plan."
                 cat > ai_plan.lock.json <<'JSON'
-{"stages":[
-  {"name":"Checkout Code","command":"echo \\"Repo: ${REPO_NAME}, branch: ${BRANCH}, build: ${BUILD_NUMBER}\\""},
-  {"name":"Install Dependencies","command":"npm ci --prefer-offline || npm install --prefer-offline || true"},
-  {"name":"Build Project","command":"npm run build || echo \\"No build script, skipping.\\""},
-  {"name":"Run Unit Tests","command":"npm test || echo \\"No tests, skipping.\\""}
-]}
-JSON
+                {"stages":[
+                  {"name":"Checkout Code","command":"echo \\"Repo: ${REPO_NAME}, branch: ${BRANCH}, build: ${BUILD_NUMBER}\\""},
+                  {"name":"Install Dependencies","command":"npm ci --prefer-offline || npm install --prefer-offline || true"},
+                  {"name":"Build Project","command":"npm run build || echo \\"No build script, skipping.\\""},
+                  {"name":"Run Unit Tests","command":"npm test || echo \\"No tests, skipping.\\""}
+                ]}
+                JSON
                 jq . ai_plan.lock.json > ai_plan.json
                 echo "health-check-failed" > .http_status
                 exit 0
@@ -96,13 +96,13 @@ JSON
               else
                 echo "Planner failed or returned non-JSON. Using fallback plan."
                 cat > ai_plan.lock.json <<'JSON'
-{"stages":[
-  {"name":"Checkout Code","command":"echo \\"Repo: ${REPO_NAME}, branch: ${BRANCH}, build: ${BUILD_NUMBER}\\""},
-  {"name":"Install Dependencies","command":"npm ci --prefer-offline || npm install --prefer-offline || true"},
-  {"name":"Build Project","command":"npm run build || echo \\"No build script, skipping.\\""},
-  {"name":"Run Unit Tests","command":"npm test || echo \\"No tests, skipping.\\""}
-]}
-JSON
+                {"stages":[
+                  {"name":"Checkout Code","command":"echo \\"Repo: ${REPO_NAME}, branch: ${BRANCH}, build: ${BUILD_NUMBER}\\""},
+                  {"name":"Install Dependencies","command":"npm ci --prefer-offline || npm install --prefer-offline || true"},
+                  {"name":"Build Project","command":"npm run build || echo \\"No build script, skipping.\\""},
+                  {"name":"Run Unit Tests","command":"npm test || echo \\"No tests, skipping.\\""}
+                ]}
+                JSON
                 jq . ai_plan.lock.json > ai_plan.json
               fi
             '''

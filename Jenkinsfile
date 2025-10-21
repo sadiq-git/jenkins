@@ -1,14 +1,10 @@
-
 pipeline {
   agent any
-  options {
-    timestamps()
-    ansiColor('xterm')
-  }
+
   environment {
-    // If you add a Jenkins string credential named AI_PLANNER_URL, it will override the default.
     AI_PLANNER_URL = 'http://ai-planner:8000'
   }
+
   stages {
     stage('Checkout') {
       steps {
@@ -22,9 +18,8 @@ pipeline {
           def ctx = [
             branch:        env.BRANCH_NAME ?: sh(script: "git rev-parse --abbrev-ref HEAD", returnStdout: true).trim(),
             lastCommitMsg: sh(script: "git log -1 --pretty=%B || true", returnStdout: true).trim(),
-            buildNumber:   env.BUILD_NUMBER,
-            repoName:      env.JOB_NAME,
-            culprit:       currentBuild.rawBuild?.getCauses()?.collect{ it.properties }.toString()
+            buildNumber:   env.BUILD_NUMBER as Integer,
+            repoName:      env.JOB_NAME
           ]
           writeFile file: 'context.json', text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(ctx))
           echo "Context:\n${readFile('context.json')}"
@@ -40,7 +35,9 @@ pipeline {
             returnStdout: true,
             script: """
               set -e
-              curl -sS -X POST "$AI_PLANNER_URL/plan"                 -H 'Content-Type: application/json'                 --data-binary @context.json
+              curl -sS -X POST "$AI_PLANNER_URL/plan" \
+                -H 'Content-Type: application/json' \
+                --data-binary @context.json
             """
           ).trim()
 

@@ -20,14 +20,15 @@ SAFE_FALLBACK_PLAN = {
     ]
 }
 
+# NOTE: all JSON braces are escaped with double braces so .format() only fills {max_stages}
 JSON_SCHEMA_HINT = """
 Respond with STRICT JSON only (no markdown/code fences). The JSON must follow:
-{
+{{
   "stages": [
-    { "name": "Build", "command": "bash command here" },
-    { "name": "Test",  "command": "bash command here" }
+    {{ "name": "Build", "command": "bash command here" }},
+    {{ "name": "Test",  "command": "bash command here" }}
   ]
-}
+}}
 Rules:
 - At most {max_stages} stages.
 - Each 'name' is <= 40 chars, alnum/space/.- only.
@@ -44,7 +45,6 @@ def _extract_json(maybe_json: str) -> str:
         return "{}"
     cleaned = re.sub(r"```(json)?", "", maybe_json, flags=re.IGNORECASE)
     cleaned = cleaned.replace("```", "").strip()
-    # Grab the first {...} block
     m = re.search(r"\{[\s\S]*\}", cleaned)
     return m.group(0) if m else cleaned
 
@@ -67,7 +67,7 @@ def _postprocess_and_filter(plan: Dict[str, Any]) -> Dict[str, Any]:
 def make_app() -> Flask:
     app = Flask(__name__)
 
-    # --- Logging: integrate with gunicorn if present ---
+    # Tie Flask logs to gunicorn if available
     gunicorn_error_logger = logging.getLogger("gunicorn.error")
     if gunicorn_error_logger.handlers:
         app.logger.handlers = gunicorn_error_logger.handlers
@@ -75,12 +75,10 @@ def make_app() -> Flask:
     else:
         logging.basicConfig(level=logging.INFO)
 
-    # --- GenAI client ---
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        # We still raise here so container fails fast if key is missing.
-        # (healthz doesn't call the API, so missing key would be confusing later)
         raise RuntimeError("GEMINI_API_KEY must be set")
+
     client = genai.Client(api_key=api_key)
     app.config["GENAI_CLIENT"] = client
 
@@ -90,7 +88,6 @@ def make_app() -> Flask:
 
     @app.get("/healthz")
     def healthz():
-        # Does not call the model; just reports readiness and chosen model
         return jsonify({"ok": True, "model": GEMINI_MODEL})
 
     @app.post("/echo")
@@ -101,10 +98,10 @@ def make_app() -> Flask:
     @app.post("/plan")
     def plan():
         """
-        Returns 200 with a valid JSON body ALWAYS.
-        On any error, responds with SAFE_FALLBACK_PLAN + meta explaining the reason.
+        Always returns HTTP 200 with JSON.
+        On any error, returns SAFE_FALLBACK_PLAN and meta.reason.
         """
-        try:
+        try:   
             ctx = request.get_json(silent=True) or {}
             prompt = f"""
 You are a CI/CD planner that outputs STRICT JSON only.
@@ -121,18 +118,16 @@ Focus:
 - Avoid secrets/inline tokens.
 """
 
-            # --- Call Gemini securely ---
+            # Call Gemini
             try:
                 resp = app.config["GENAI_CLIENT"].models.generate_content(
                     model=GEMINI_MODEL,
                     contents=prompt
                 )
-                # Prefer resp.text if available; otherwise try candidates
                 text = getattr(resp, "text", None)
                 if not text:
                     try:
                         cand0 = (resp.candidates or [])[0]
-                        # Depending on SDK shape; try common paths
                         part0 = getattr(cand0, "content", None)
                         if part0 and getattr(part0, "parts", None):
                             text = part0.parts[0].text
@@ -145,7 +140,7 @@ Focus:
                     "meta": {"fallback": True, "reason": f"gemini_error: {str(e)}"}
                 }), 200
 
-            # --- Parse JSON from model text ---
+            # Parse JSON
             try:
                 raw_json = _extract_json(text).strip()
                 plan_dict = json.loads(raw_json)
@@ -156,7 +151,7 @@ Focus:
                     "meta": {"fallback": True, "reason": f"json_error: {str(e)}", "raw": (text or "")[:800]}
                 }), 200
 
-            # --- Filter & return ---
+            # Filter & return
             filtered = _postprocess_and_filter(plan_dict)
             return jsonify(filtered), 200
 

@@ -8,9 +8,10 @@ pipeline {
   }
 
   environment {
-    AI_PLANNER_URL = 'http://host.docker.internal:8000'  // Windows/macOS Docker Desktop
+    AI_PLANNER_URL = 'http://ai-planner:8000'
     NPM_CONFIG_CACHE = "${WORKSPACE}/.npm"
     CI = "true"
+    
   }
 
   stages {
@@ -49,9 +50,8 @@ pipeline {
       steps {
         script {
           // Share Jenkins container network so the hostname "ai-planner" resolves
-          def netOpt = "--network container:${env.HOSTNAME}"
-
-          docker.image('node-ci:20-bookworm-slim').inside('--add-host=host.docker.internal:host-gateway -u 0:0') {
+          def netOpt = '--network agentic-jenkins_default' 
+          docker.image('node-ci:20-bookworm-slim').inside("${netOpt} -u 0:0") {
             sh label: 'Request plan from AI', script: '''
               set -e
 

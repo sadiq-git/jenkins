@@ -69,29 +69,31 @@ pipeline {
     stage('Execute Plan (Node)') {
       steps {
         script {
-          // Uses your prebuilt image with git/curl/jq/etc. baked in
-          docker.image('node-ci:20-bookworm-slim').inside('-u 0:0') {
-            sh '''
-              set -e
-              mkdir -p "$NPM_CONFIG_CACHE"
-              if [ -f package-lock.json ]; then
-                npm ci --no-audit --prefer-offline || true
-              elif [ -f package.json ]; then
-                npm install --no-audit --prefer-offline || true
-              fi
-            '''
-            def plan = readJSON file: 'ai_plan.lock.json'
-            plan.stages.each { stg ->
-              stage("AI: ${stg.name}") {
-                sh label: stg.name, script: stg.command
+          // read context to export env vars for plan stages
+          def ctx = readJSON file: 'context.json'
+          withEnv(["BRANCH=${ctx.branch}", "REPO_NAME=${ctx.repoName}"]) {
+            docker.image('node-ci:20-bookworm-slim').inside('-u 0:0') {
+              sh '''
+                set -e
+                mkdir -p "$NPM_CONFIG_CACHE"
+                if [ -f package-lock.json ]; then
+                  npm ci --no-audit --prefer-offline || true
+                elif [ -f package.json ]; then
+                  npm install --no-audit --prefer-offline || true
+                fi
+              '''
+              def plan = readJSON file: 'ai_plan.lock.json'
+              plan.stages.each { stg ->
+                stage("AI: ${stg.name}") {
+                  sh label: stg.name, script: stg.command
+                }
               }
             }
           }
         }
       }
     }
-  }
-
+  } 
   post {
     always {
       archiveArtifacts artifacts: 'context.json, ai_plan.json, ai_plan.lock.json', onlyIfSuccessful: false

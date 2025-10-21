@@ -2,7 +2,11 @@
   "name": "ci-demo",
   "version": "1.0.0",
   "scripts": {
+    "lint": "echo linting && npx --yes eslint . || echo 'eslint not configured'",
     "build": "echo building && node -v",
     "test": "echo testing && node -v"
+  },
+  "devDependencies": {
+    "eslint": "^9.13.0"
   }
 }

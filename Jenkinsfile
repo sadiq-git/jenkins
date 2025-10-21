@@ -6,7 +6,7 @@ pipeline {
     skipDefaultCheckout(true)   // <— turn off the implicit "Declarative: Checkout SCM"
   }
   environment {
-    AI_PLANNER_URL = credentials('AI_PLANNER_URL') ?: 'http://ai-planner:8000' // or hardcode the URL if you prefer
+    AI_PLANNER_URL = 'http://ai-planner:8000'
     NPM_CONFIG_CACHE = "${WORKSPACE}/.npm"
     CI = "true"
   }
